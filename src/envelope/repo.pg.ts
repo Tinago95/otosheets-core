@@ -52,13 +52,41 @@ export interface AddRecipientInput {
 
 export interface DispatchInput {
     recipientId: string;
-    tokenHash: string;
+    /**
+     * Supply this ONLY when a new link is genuinely being issued. The stored
+     * hash is the only copy of the credential that exists, so writing a new one
+     * stops the link already sitting in somebody's inbox from resolving.
+     * Omitting it keeps the credential the recipient already has, which is what
+     * lets a caller record a message id, or re-mark a send, without silently
+     * cancelling the link it is about.
+     *
+     * The expiry and the access code travel with the token: a new link gets its
+     * own, and a call that is not issuing one leaves all of them alone.
+     */
+    tokenHash?: string | null;
     expiresAt?: string | null;
     sesMessageId?: string | null;
     accessCodeHash?: string | null;
     accessCodeSalt?: string | null;
     accessCodeParams?: Record<string, unknown> | null;
     accessCodeChannel?: string | null;
+}
+
+/**
+ * The credential state a recipient held before a dispatch claimed them, so a
+ * caller whose send was refused can put it back exactly as it was rather than
+ * leaving a live link dead and nothing delivered in its place.
+ */
+export interface DispatchSnapshot {
+    tokenHash: string | null;
+    expiresAt: string | null;
+    sesMessageId: string | null;
+    accessCodeHash: string | null;
+    accessCodeSalt: string | null;
+    accessCodeParams: Record<string, unknown> | null;
+    accessCodeChannel: string | null;
+    status: string;
+    dispatchedAt: string | null;
 }
 
 export interface AddFieldInput {
@@ -368,9 +396,8 @@ export class EnvelopePgRepo {
      * How many signers still owe a signature on this version.
      *
      * Computed in the database rather than by walking a recipients list the
-     * caller loaded earlier. Completion decided from a stale read is how two
-     * final signers arriving at the same moment both conclude they were last,
-     * and the envelope gets completed (and emailed) twice.
+     * caller loaded earlier. This is a READ, and a read is never enough to
+     * decide completion on its own: see `completeOnce` for why.
      *
      * A revoked signer is not outstanding, and a voided signature does not
      * count as given.
@@ -390,6 +417,49 @@ export class EnvelopePgRepo {
                 )`,
             ));
         return Number((rows[0] as any)?.n ?? 0);
+    }
+
+    /**
+     * Complete the document once, and only if nobody still owes a signature.
+     *
+     * The count and the status write are ONE statement on purpose. Counting and
+     * then writing lets two final signers whose signature rows both commit
+     * before either counts read the same zero and both conclude they were last,
+     * so the document completes, and is emailed, twice. Nothing in the schema
+     * stopped that: what happened to absorb it was the chain's unique index
+     * refusing the second completed entry, which is an accident of a constraint
+     * meant for something else and surfaces as a thrown error rather than a
+     * quiet no-op.
+     *
+     * `status <> 'completed'` is the wall now, and the boolean says who won, so
+     * the completion entry, the seal and the completion email happen once.
+     * A caller that did not win still gets the outstanding count, because
+     * losing the flip and still owing signatures are different answers.
+     */
+    async completeOnce(envelopeId: string, versionId: string): Promise<{ completed: boolean; outstanding: number }> {
+        const now = new Date().toISOString();
+        const rows = await (this.db as any).update(envelopes)
+            .set({ status: 'completed', completedAt: now, updatedAt: now })
+            .where(and(
+                eq(envelopes.envelopeId, envelopeId),
+                sql`${envelopes.status} <> 'completed'`,
+                sql`NOT EXISTS (
+                    SELECT 1 FROM envelope_recipients r
+                     WHERE r.envelope_id = ${envelopes.envelopeId}
+                       AND r.role = 'signer'
+                       AND r.revoked_at IS NULL
+                       AND NOT EXISTS (
+                           SELECT 1 FROM envelope_signatures s
+                            WHERE s.recipient_id = r.recipient_id
+                              AND s.version_id = ${versionId}
+                              AND s.voided_at IS NULL
+                       )
+                )`,
+            ))
+            .returning({ id: envelopes.envelopeId });
+
+        if (rows.length > 0) return { completed: true, outstanding: 0 };
+        return { completed: false, outstanding: await this.countOutstandingSigners(envelopeId, versionId) };
     }
 
     async get(envelopeId: string): Promise<EnvelopeDTO | null> {
@@ -507,26 +577,117 @@ export class EnvelopePgRepo {
     }
 
     /**
-     * Attach the credential and mark the link as sent.
+     * Claim the dispatch: attach the credential and mark the link as sent.
      *
-     * The SES message id is stored HERE, at the moment of sending, because it is
-     * the only handle a later bounce notification carries. Captured afterwards
-     * it correlates nothing, and the reminder sweep goes on mailing an address
-     * that never received anything.
+     * This is the sent-marker, and it is written BEFORE the email leaves. Every
+     * trigger that reaches it is at-least-once, so a send that SES accepts and
+     * whose marker is then lost is a second link mailed to the same person by
+     * the next attempt.
+     *
+     * The claim is refused for a revoked recipient, so a link the owner pulled
+     * cannot be re-issued by a retry that was already in flight. The caller is
+     * told whether it claimed, rather than being left to assume it did.
+     *
+     * Only the columns the caller actually supplies are written. Omitting
+     * `tokenHash` keeps the credential the recipient already has: the stored
+     * hash is the only copy of the link, so replacing it has to be an explicit
+     * act, not what a caller gets for recording a message id after the send.
+     * The message id itself only exists once SES has answered, which is why
+     * recording it is a second call and not part of the claim.
+     *
+     * The previous credential comes back so a refused send can be put back
+     * exactly as it was. Two dispatches racing the same recipient both read the
+     * same previous state under READ COMMITTED; the loser's link is the one
+     * that dies, which is the same outcome as sending twice in any order.
      */
-    async markDispatched(input: DispatchInput): Promise<void> {
-        await (this.db as any).update(envelopeRecipients).set({
-            tokenHash: input.tokenHash,
-            expiresAt: input.expiresAt ?? null,
-            sesMessageId: input.sesMessageId ?? null,
-            accessCodeHash: input.accessCodeHash ?? null,
-            accessCodeSalt: input.accessCodeSalt ?? null,
-            accessCodeParams: (input.accessCodeParams ?? null) as any,
-            accessCodeChannel: input.accessCodeChannel ?? null,
-            status: 'dispatched',
-            dispatchedAt: new Date().toISOString(),
+    async markDispatched(input: DispatchInput): Promise<{ claimed: boolean; previous: DispatchSnapshot | null }> {
+        const now = new Date().toISOString();
+        return await (this.tx as any).transaction(async (tx: any) => {
+            const before = await tx.select({
+                tokenHash: envelopeRecipients.tokenHash,
+                expiresAt: envelopeRecipients.expiresAt,
+                sesMessageId: envelopeRecipients.sesMessageId,
+                accessCodeHash: envelopeRecipients.accessCodeHash,
+                accessCodeSalt: envelopeRecipients.accessCodeSalt,
+                accessCodeParams: envelopeRecipients.accessCodeParams,
+                accessCodeChannel: envelopeRecipients.accessCodeChannel,
+                status: envelopeRecipients.status,
+                dispatchedAt: envelopeRecipients.dispatchedAt,
+            }).from(envelopeRecipients)
+                .where(eq(envelopeRecipients.recipientId, input.recipientId))
+                .limit(1);
+            const previous = (before[0] as DispatchSnapshot | undefined) ?? null;
+
+            const set: Record<string, unknown> = {
+                status: 'dispatched',
+                dispatchedAt: now,
+                updatedAt: now,
+            };
+            if (input.sesMessageId !== undefined) set.sesMessageId = input.sesMessageId ?? null;
+            if (input.tokenHash) {
+                set.tokenHash = input.tokenHash;
+                set.expiresAt = input.expiresAt ?? null;
+                set.accessCodeHash = input.accessCodeHash ?? null;
+                set.accessCodeSalt = input.accessCodeSalt ?? null;
+                set.accessCodeParams = (input.accessCodeParams ?? null) as any;
+                set.accessCodeChannel = input.accessCodeChannel ?? null;
+            }
+
+            const rows = await tx.update(envelopeRecipients).set(set)
+                .where(and(
+                    eq(envelopeRecipients.recipientId, input.recipientId),
+                    sql`${envelopeRecipients.revokedAt} IS NULL`,
+                ))
+                .returning({ id: envelopeRecipients.recipientId });
+
+            return { claimed: rows.length > 0, previous };
+        });
+    }
+
+    /**
+     * Undo a claim whose send was refused, so the attempt costs nothing.
+     *
+     * Restoring the previous credential is the point: without it a refused
+     * resend leaves the recipient holding a token nobody was ever told, and the
+     * link they already had stops working because its hash was overwritten.
+     *
+     * Guarded on the hash this caller wrote. If another dispatch has claimed
+     * the recipient since, that one owns the live link and putting an older
+     * credential back over it would break the email that did go out.
+     */
+    async rollbackDispatch(
+        recipientId: string,
+        claimedTokenHash: string | null,
+        previous: DispatchSnapshot | null,
+    ): Promise<{ restored: boolean }> {
+        // A first send has nothing to restore TO, so the undo is to clear the
+        // claim rather than to do nothing. Leaving it would mark a recipient
+        // dispatched, holding a token nobody was ever told, for an email that
+        // was refused, and the owner's screen would read "sent".
+        const undo = previous ?? {
+            tokenHash: null, expiresAt: null, sesMessageId: null,
+            accessCodeHash: null, accessCodeSalt: null, accessCodeParams: null,
+            accessCodeChannel: 'none', status: 'pending', dispatchedAt: null,
+        } as unknown as DispatchSnapshot;
+
+        const rows = await (this.db as any).update(envelopeRecipients).set({
+            tokenHash: undo.tokenHash,
+            expiresAt: undo.expiresAt,
+            sesMessageId: undo.sesMessageId,
+            accessCodeHash: undo.accessCodeHash,
+            accessCodeSalt: undo.accessCodeSalt,
+            accessCodeParams: undo.accessCodeParams as any,
+            accessCodeChannel: undo.accessCodeChannel,
+            status: undo.status,
+            dispatchedAt: undo.dispatchedAt,
             updatedAt: new Date().toISOString(),
-        }).where(eq(envelopeRecipients.recipientId, input.recipientId));
+        }).where(and(
+            eq(envelopeRecipients.recipientId, recipientId),
+            claimedTokenHash
+                ? eq(envelopeRecipients.tokenHash, claimedTokenHash)
+                : sql`${envelopeRecipients.tokenHash} IS NULL`,
+        )).returning({ id: envelopeRecipients.recipientId });
+        return { restored: rows.length > 0 };
     }
 
     /** First open only. Re-opening is not a new fact worth another chain entry. */
@@ -576,12 +737,30 @@ export class EnvelopePgRepo {
         return { recorded: rows.length > 0 };
     }
 
-    /** Revoking is a column write, which is the whole reason the token is stored rather than keyed. */
-    async revokeRecipient(recipientId: string, reason: string): Promise<void> {
+    /**
+     * Revoking is a column write, which is the whole reason the token is stored
+     * rather than keyed.
+     *
+     * The envelope id is required and is part of the WHERE clause. Its callers
+     * check the ENVELOPE against the acting org and then pass a child id
+     * straight off the path, so scoping this by recipient id alone let one org
+     * revoke another org's link by naming it. The parameter is deliberately not
+     * optional: a default would put the hole back the first time somebody added
+     * a call site and did not have an envelope id to hand.
+     *
+     * Returns whether it matched, so a caller can answer "no such recipient on
+     * this document" rather than reporting a revocation that never happened.
+     */
+    async revokeRecipient(envelopeId: string, recipientId: string, reason: string): Promise<{ revoked: boolean }> {
         const now = new Date().toISOString();
-        await (this.db as any).update(envelopeRecipients)
+        const rows = await (this.db as any).update(envelopeRecipients)
             .set({ revokedAt: now, revokedReason: reason, status: 'revoked', updatedAt: now })
-            .where(eq(envelopeRecipients.recipientId, recipientId));
+            .where(and(
+                eq(envelopeRecipients.recipientId, recipientId),
+                eq(envelopeRecipients.envelopeId, envelopeId),
+            ))
+            .returning({ id: envelopeRecipients.recipientId });
+        return { revoked: rows.length > 0 };
     }
 
     async setEnvelopeStatus(envelopeId: string, status: EnvelopeStatus): Promise<void> {
@@ -653,8 +832,26 @@ export class EnvelopePgRepo {
         return { fieldId: input.fieldId, created: inserted.length > 0 };
     }
 
-    async removeField(fieldId: string): Promise<void> {
-        await (this.db as any).delete(envelopeFields).where(eq(envelopeFields.fieldId, fieldId));
+    /**
+     * Remove a field, scoped to the document it is on.
+     *
+     * A field hangs off a version rather than an envelope, so the envelope id
+     * has to be reached through `envelope_versions`. Deleting by field id alone
+     * meant a handler that had checked the envelope against the acting org then
+     * deleted whatever field id it was handed, including one belonging to
+     * another org. Required, not optional, for the same reason as
+     * `revokeRecipient`.
+     */
+    async removeField(envelopeId: string, fieldId: string): Promise<{ removed: boolean }> {
+        const rows = await (this.db as any).delete(envelopeFields)
+            .where(and(
+                eq(envelopeFields.fieldId, fieldId),
+                sql`${envelopeFields.versionId} IN (
+                    SELECT version_id FROM envelope_versions WHERE envelope_id = ${envelopeId}
+                )`,
+            ))
+            .returning({ id: envelopeFields.fieldId });
+        return { removed: rows.length > 0 };
     }
 
     /** Fill one field as part of signing. */
@@ -1000,13 +1197,26 @@ export class EnvelopePgRepo {
     // ── artifacts ────────────────────────────────────────────────────────
 
     /**
-     * Store a sealed artifact. The unique index on (envelope_id, kind) means the
-     * first writer wins and every later one is told so, rather than a second
-     * seal quietly replacing the first. Chromium output is deterministic for a
-     * build and not across builds, so a regenerated seal would not match the
-     * hash the chain already attests to.
+     * Take the (envelope_id, kind) slot. The unique index means the first
+     * writer wins and every later one is told so, rather than a second seal
+     * quietly replacing the first. Chromium output is deterministic for a build
+     * and not across builds, so a regenerated seal would not match the hash the
+     * chain already attests to.
+     *
+     * The slot has to be claimed before the PDF exists, or two seals both
+     * produce one. That leaves a window: a claim whose producer then threw, or
+     * timed out, holds the slot with nothing behind it. Reporting that as
+     * "already sealed" makes the failure permanent, because every retry is
+     * refused and the document can never be sealed at all. So a claim with no
+     * bytes behind it is takeable again, and the caller is told it resumed one
+     * rather than started fresh.
+     *
+     * `sealed: true` means the caller owns the slot and MUST call
+     * `finaliseArtifact` once the bytes are up. Until it does, the row holds
+     * whatever placeholder key it was claimed with and the bytes cannot be
+     * found again.
      */
-    async sealOnce(input: SealArtifactInput): Promise<{ sealed: boolean; existingS3Key?: string }> {
+    async sealOnce(input: SealArtifactInput): Promise<{ sealed: boolean; resumed?: boolean; existingS3Key?: string }> {
         const inserted = await (this.db as any).insert(envelopeArtifacts).values({
             artifactId: input.artifactId,
             envelopeId: input.envelopeId,
@@ -1022,15 +1232,91 @@ export class EnvelopePgRepo {
 
         if (inserted.length > 0) return { sealed: true };
 
-        const existing = await this.db.select({ k: envelopeArtifacts.s3Key })
+        const existing = await this.db.select({ k: envelopeArtifacts.s3Key, n: envelopeArtifacts.byteSize })
             .from(envelopeArtifacts)
             .where(and(
                 eq(envelopeArtifacts.envelopeId, input.envelopeId),
                 eq(envelopeArtifacts.kind, input.kind),
             )).limit(1);
+
+        if (Number((existing[0] as any)?.n ?? UNFINALISED_BYTE_SIZE) === UNFINALISED_BYTE_SIZE) {
+            return { sealed: true, resumed: true };
+        }
         return { sealed: false, existingS3Key: (existing[0] as any)?.k };
     }
+
+    /**
+     * Write the real bytes onto a claimed slot.
+     *
+     * Without this the artifact row keeps the placeholder key it was claimed
+     * with, so a seal that succeeded end to end still leaves the sealed PDF
+     * unfindable: nothing downstream can turn an envelope into the object it
+     * was sealed to.
+     *
+     * An artifact that already has bytes is only rewritten when the hash is
+     * identical, which makes a retried finalise a no-op instead of a second
+     * seal replacing the first. A different hash means different bytes, and the
+     * chain already attests to the first ones, so the write is refused and the
+     * caller is told.
+     */
+    async finaliseArtifact(
+        envelopeId: string,
+        kind: ArtifactKind,
+        bytes: { s3Key: string; sha256: string; byteSize: number },
+    ): Promise<{ finalised: boolean }> {
+        // A zero-byte artifact is indistinguishable from an unfinalised claim,
+        // so accepting one here would seal the document to nothing and leave
+        // the slot looking retryable for ever.
+        if (!(bytes.byteSize > UNFINALISED_BYTE_SIZE)) {
+            throw new Error('An artifact with no bytes is not an artifact');
+        }
+        const rows = await (this.db as any).update(envelopeArtifacts)
+            .set({ s3Key: bytes.s3Key, sha256: bytes.sha256, byteSize: bytes.byteSize })
+            .where(and(
+                eq(envelopeArtifacts.envelopeId, envelopeId),
+                eq(envelopeArtifacts.kind, kind),
+                sql`(${envelopeArtifacts.byteSize} = ${UNFINALISED_BYTE_SIZE} OR ${envelopeArtifacts.sha256} = ${bytes.sha256})`,
+            ))
+            .returning({ id: envelopeArtifacts.artifactId });
+        return { finalised: rows.length > 0 };
+    }
+
+    /**
+     * The stored artifact for one kind, or null.
+     *
+     * An unfinalised claim is not returned by default. Its key is a
+     * placeholder, so handing it out would give a caller a path to an object
+     * that does not exist; only a caller reasoning about the seal itself wants
+     * to see one.
+     */
+    async getArtifact(envelopeId: string, kind: ArtifactKind, opts: { includeUnfinalised?: boolean } = {}) {
+        const clauses = [
+            eq(envelopeArtifacts.envelopeId, envelopeId),
+            eq(envelopeArtifacts.kind, kind),
+        ];
+        if (!opts.includeUnfinalised) clauses.push(sql`${envelopeArtifacts.byteSize} > ${UNFINALISED_BYTE_SIZE}`);
+        const r = await this.db.select().from(envelopeArtifacts).where(and(...clauses)).limit(1);
+        return (r[0] as any) ?? null;
+    }
+
+    /** Every artifact on a document: the original, the sealed copy, the certificate. */
+    async listArtifacts(envelopeId: string, opts: { includeUnfinalised?: boolean } = {}) {
+        const clauses = [eq(envelopeArtifacts.envelopeId, envelopeId)];
+        if (!opts.includeUnfinalised) clauses.push(sql`${envelopeArtifacts.byteSize} > ${UNFINALISED_BYTE_SIZE}`);
+        return this.db.select().from(envelopeArtifacts)
+            .where(and(...clauses))
+            .orderBy(asc(envelopeArtifacts.createdAt));
+    }
 }
+
+/**
+ * A claimed artifact slot with nothing behind it yet. The slot is taken before
+ * the bytes exist so two seals cannot both produce them, so a row still holding
+ * zero bytes means the producer never reached the upload. There is no separate
+ * column for this: the byte count already says it, and an artifact of zero
+ * bytes is not a thing that can legitimately exist.
+ */
+const UNFINALISED_BYTE_SIZE = 0;
 
 /** Postgres reports a unique violation as SQLSTATE 23505, whichever driver is in front of it. */
 function isUniqueViolation(err: unknown): boolean {

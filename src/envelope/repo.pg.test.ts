@@ -26,14 +26,19 @@ async function addRecipient(envelopeId: string, role: string, over: Record<strin
     return recipientId;
 }
 
-async function makeEnvelope(kind = 'proposal') {
+async function makeEnvelope(kind = 'proposal', orgId = 'org_1') {
     const envelopeId = id('env');
     const versionId = id('ver');
     await repo.create({
-        envelopeId, orgId: 'org_1', createdBy: 'user_1', createdByLabel: 'Leon',
+        envelopeId, orgId, createdBy: 'user_1', createdByLabel: 'Leon',
         title: 'Roof replacement', kind, versionId,
     });
     return { envelopeId, versionId };
+}
+
+/** Somebody else's document, for the scoping tests. */
+async function otherOrgEnvelope() {
+    return makeEnvelope('proposal', 'org_2');
 }
 
 beforeAll(async () => {
@@ -42,6 +47,7 @@ beforeAll(async () => {
     await runMigrations(executor);
     db = drizzle(pglite) as unknown as PgDb;
     await pglite.query("INSERT INTO orgs (org_id, name) VALUES ('org_1', 'Acme')");
+    await pglite.query("INSERT INTO orgs (org_id, name) VALUES ('org_2', 'Someone else')");
     // PGlite is a single connection, so the same handle serves reads and the
     // transactional path. That is what makes the concurrency test below a real
     // test of the UNIQUE constraint rather than of connection isolation.
@@ -227,8 +233,41 @@ describe('completion', () => {
         const { envelopeId, versionId } = await makeEnvelope();
         const a = await addRecipient(envelopeId, 'signer');
         expect(await repo.countOutstandingSigners(envelopeId, versionId)).toBe(1);
-        await repo.revokeRecipient(a, 'removed from the document');
+        await repo.revokeRecipient(envelopeId, a, 'removed from the document');
         expect(await repo.countOutstandingSigners(envelopeId, versionId)).toBe(0);
+    });
+
+    it('completes once, and the loser is told it did not win', async () => {
+        const { envelopeId, versionId } = await makeEnvelope();
+        const a = await addRecipient(envelopeId, 'signer');
+        const b = await addRecipient(envelopeId, 'signer');
+
+        // Still owed, so nothing flips and the caller learns what is missing.
+        await repo.recordSignature({ signatureId: id('sig'), versionId, recipientId: a, typedName: 'A' });
+        expect(await repo.completeOnce(envelopeId, versionId)).toEqual({ completed: false, outstanding: 1 });
+        expect((await repo.get(envelopeId))?.status).toBe('draft');
+
+        await repo.recordSignature({ signatureId: id('sig'), versionId, recipientId: b, typedName: 'B' });
+
+        // Two final signers arriving together. Exactly one flips it, so the
+        // completion entry and the completion email happen once.
+        const both = await Promise.all([
+            repo.completeOnce(envelopeId, versionId),
+            repo.completeOnce(envelopeId, versionId),
+        ]);
+        expect(both.filter((r) => r.completed)).toHaveLength(1);
+        expect((await repo.get(envelopeId))?.status).toBe('completed');
+        expect((await repo.get(envelopeId) as any)?.completedAt).toBeTruthy();
+
+        // And a replay long afterwards is still a no-op, not a second completion.
+        expect((await repo.completeOnce(envelopeId, versionId)).completed).toBe(false);
+    });
+
+    it('does not complete a document nobody has signed', async () => {
+        const { envelopeId, versionId } = await makeEnvelope();
+        await addRecipient(envelopeId, 'signer');
+        expect(await repo.completeOnce(envelopeId, versionId)).toEqual({ completed: false, outstanding: 1 });
+        expect((await repo.get(envelopeId))?.status).toBe('draft');
     });
 
     it('lists versions in order', async () => {
@@ -320,8 +359,112 @@ describe('recipients and delivery', () => {
         await repo.markDispatched({ recipientId: rid, tokenHash: 'th_revoke' });
         expect(await repo.resolveByTokenHash('th_revoke')).toBeTruthy();
 
-        await repo.revokeRecipient(rid, 'verdict returned');
+        expect(await repo.revokeRecipient(envelopeId, rid, 'verdict returned')).toEqual({ revoked: true });
         expect(await repo.resolveByTokenHash('th_revoke')).toBeNull();
+    });
+
+    it('will not revoke a link belonging to another document', async () => {
+        // The handler checks the ENVELOPE against the acting org and then hands
+        // over a recipient id off the path, so scoping by recipient alone let
+        // one org kill another org's link by naming it.
+        const mine = await makeEnvelope();
+        const theirs = await otherOrgEnvelope();
+        const victim = id('rcp');
+        await repo.addRecipient({ recipientId: victim, envelopeId: theirs.envelopeId, role: 'signer', email: 'them@x.com' });
+        await repo.markDispatched({ recipientId: victim, tokenHash: 'th_other_org' });
+
+        expect(await repo.revokeRecipient(mine.envelopeId, victim, 'nice try')).toEqual({ revoked: false });
+        expect((await repo.resolveByTokenHash('th_other_org'))?.recipientId).toBe(victim);
+        expect((await repo.getRecipient(victim)).revokedAt).toBeNull();
+
+        // And the owner of the document can still revoke it.
+        expect(await repo.revokeRecipient(theirs.envelopeId, victim, 'sender revoked')).toEqual({ revoked: true });
+        expect(await repo.resolveByTokenHash('th_other_org')).toBeNull();
+    });
+
+    it('claims the dispatch before the email and rolls it back if the send is refused', async () => {
+        const { envelopeId } = await makeEnvelope();
+        const rid = id('rcp');
+        await repo.addRecipient({ recipientId: rid, envelopeId, role: 'signer', email: 'a@x.com' });
+        await repo.markDispatched({ recipientId: rid, tokenHash: 'th_live', expiresAt: '2099-01-01T00:00:00.000Z', sesMessageId: 'msg-live' });
+
+        // A resend claims a new credential and gets the old one back.
+        const claim = await repo.markDispatched({ recipientId: rid, tokenHash: 'th_resend', expiresAt: '2099-06-01T00:00:00.000Z' });
+        expect(claim.claimed).toBe(true);
+        expect(claim.previous?.tokenHash).toBe('th_live');
+        expect(await repo.resolveByTokenHash('th_live')).toBeNull();
+
+        // The send is refused, so the link already delivered has to come back.
+        expect(await repo.rollbackDispatch(rid, 'th_resend', claim.previous)).toEqual({ restored: true });
+        expect((await repo.resolveByTokenHash('th_live'))?.recipientId).toBe(rid);
+        expect(await repo.resolveByTokenHash('th_resend')).toBeNull();
+        const back = await repo.getRecipient(rid);
+        expect(back.sesMessageId).toBe('msg-live');
+        expect(back.expiresAt).toBe('2099-01-01T00:00:00.000Z');
+    });
+
+    it('leaves a recipient exactly as it found them when a first send is refused', async () => {
+        const { envelopeId } = await makeEnvelope();
+        const rid = id('rcp');
+        await repo.addRecipient({ recipientId: rid, envelopeId, role: 'signer', email: 'a@x.com' });
+
+        const claim = await repo.markDispatched({ recipientId: rid, tokenHash: 'th_never_sent' });
+        await repo.rollbackDispatch(rid, 'th_never_sent', claim.previous);
+
+        const after = await repo.getRecipient(rid);
+        expect(after.status).toBe('pending');
+        expect(after.tokenHash).toBeNull();
+        expect(after.dispatchedAt).toBeNull();
+        expect(await repo.resolveByTokenHash('th_never_sent')).toBeNull();
+    });
+
+    it('will not roll back over a newer claim', async () => {
+        const { envelopeId } = await makeEnvelope();
+        const rid = id('rcp');
+        await repo.addRecipient({ recipientId: rid, envelopeId, role: 'signer', email: 'a@x.com' });
+        await repo.markDispatched({ recipientId: rid, tokenHash: 'th_first' });
+        const stale = await repo.markDispatched({ recipientId: rid, tokenHash: 'th_second' });
+        await repo.markDispatched({ recipientId: rid, tokenHash: 'th_third' });
+
+        // The second send failed, but a third has since gone out. Restoring the
+        // second's snapshot would break the link that actually reached someone.
+        expect(await repo.rollbackDispatch(rid, 'th_second', stale.previous)).toEqual({ restored: false });
+        expect((await repo.resolveByTokenHash('th_third'))?.recipientId).toBe(rid);
+    });
+
+    it('keeps the existing link when a dispatch does not issue a new one', async () => {
+        // Recording the message id after the send must not re-mint the token:
+        // the hash is the only copy of the link, so overwriting it would kill
+        // the email that just went out.
+        const { envelopeId } = await makeEnvelope();
+        const rid = id('rcp');
+        await repo.addRecipient({ recipientId: rid, envelopeId, role: 'signer', email: 'a@x.com' });
+        await repo.markDispatched({
+            recipientId: rid, tokenHash: 'th_keep', expiresAt: '2099-01-01T00:00:00.000Z',
+            accessCodeHash: 'ach', accessCodeSalt: 'salt', accessCodeChannel: 'spoken',
+        });
+
+        await repo.markDispatched({ recipientId: rid, sesMessageId: 'msg-after-send' });
+
+        const r = await repo.getRecipient(rid);
+        expect(r.tokenHash).toBe('th_keep');
+        expect(r.expiresAt).toBe('2099-01-01T00:00:00.000Z');
+        expect(r.accessCodeHash).toBe('ach');
+        expect(r.accessCodeChannel).toBe('spoken');
+        expect(r.sesMessageId).toBe('msg-after-send');
+        expect((await repo.resolveByTokenHash('th_keep'))?.recipientId).toBe(rid);
+    });
+
+    it('refuses to dispatch a revoked link', async () => {
+        const { envelopeId } = await makeEnvelope();
+        const rid = id('rcp');
+        await repo.addRecipient({ recipientId: rid, envelopeId, role: 'signer', email: 'a@x.com' });
+        await repo.revokeRecipient(envelopeId, rid, 'the sender revoked this link');
+
+        const claim = await repo.markDispatched({ recipientId: rid, tokenHash: 'th_after_revoke' });
+        expect(claim.claimed).toBe(false);
+        expect(await repo.resolveByTokenHash('th_after_revoke')).toBeNull();
+        expect((await repo.getRecipient(rid)).status).toBe('revoked');
     });
 
     it('counts wrong codes atomically and locks out', async () => {
@@ -364,8 +507,26 @@ describe('authoring', () => {
         const args = { fieldId, versionId, recipientId: signerId, type: 'date' as const, page: 1, x: 1, y: 2, w: 3, h: 4 };
         expect((await repo.addField(args)).created).toBe(true);
         expect((await repo.addField(args)).created).toBe(false);
-        await repo.removeField(fieldId);
+        expect(await repo.removeField(envelopeId, fieldId)).toEqual({ removed: true });
         expect(await repo.listFields(versionId)).toHaveLength(0);
+    });
+
+    it('will not remove a field from another document', async () => {
+        // A field hangs off a version, so the only way to prove which document
+        // it is on is to reach the envelope through envelope_versions. Deleting
+        // by field id alone let a caller who owned one document delete a field
+        // on somebody else's.
+        const mine = await makeEnvelope();
+        const theirs = await otherOrgEnvelope();
+        const signerId = await addRecipient(theirs.envelopeId, 'signer');
+        const fieldId = id('fld');
+        await repo.addField({ fieldId, versionId: theirs.versionId, recipientId: signerId, type: 'signature', page: 1, x: 1, y: 2, w: 3, h: 4 });
+
+        expect(await repo.removeField(mine.envelopeId, fieldId)).toEqual({ removed: false });
+        expect(await repo.listFields(theirs.versionId)).toHaveLength(1);
+
+        expect(await repo.removeField(theirs.envelopeId, fieldId)).toEqual({ removed: true });
+        expect(await repo.listFields(theirs.versionId)).toHaveLength(0);
     });
 
     it('supersedes the current version and moves the envelope onto it', async () => {
@@ -658,5 +819,61 @@ describe('sealing', () => {
         const { envelopeId } = await makeEnvelope();
         expect((await repo.sealOnce({ artifactId: id('art'), envelopeId, kind: 'original', s3Key: 'o.pdf', sha256: 'o', byteSize: 1 })).sealed).toBe(true);
         expect((await repo.sealOnce({ artifactId: id('art'), envelopeId, kind: 'certificate', s3Key: 'c.pdf', sha256: 'c', byteSize: 1 })).sealed).toBe(true);
+    });
+
+    it('finalises the claim, so the sealed bytes can be found afterwards', async () => {
+        // The slot is claimed with a placeholder key before the PDF exists.
+        // Without the finalise the row keeps that placeholder, and a seal that
+        // succeeded end to end still leaves nothing anyone can fetch.
+        const { envelopeId, versionId } = await makeEnvelope();
+        await repo.sealOnce({ artifactId: id('art'), envelopeId, versionId, kind: 'sealed', s3Key: 'pending', sha256: 'pending', byteSize: 0 });
+
+        expect(await repo.getArtifact(envelopeId, 'sealed')).toBeNull();
+        expect((await repo.getArtifact(envelopeId, 'sealed', { includeUnfinalised: true }))?.s3Key).toBe('pending');
+
+        expect(await repo.finaliseArtifact(envelopeId, 'sealed', {
+            s3Key: 'documents/org_1/sealed/x.pdf', sha256: 'deadbeef', byteSize: 4096,
+        })).toEqual({ finalised: true });
+
+        const art = await repo.getArtifact(envelopeId, 'sealed');
+        expect(art.s3Key).toBe('documents/org_1/sealed/x.pdf');
+        expect(art.sha256).toBe('deadbeef');
+        expect(art.byteSize).toBe(4096);
+        expect((await repo.listArtifacts(envelopeId)).map((a: any) => a.kind)).toEqual(['sealed']);
+    });
+
+    it('absorbs a repeated finalise and refuses a different one', async () => {
+        const { envelopeId } = await makeEnvelope();
+        await repo.sealOnce({ artifactId: id('art'), envelopeId, kind: 'sealed', s3Key: 'pending', sha256: 'pending', byteSize: 0 });
+        const bytes = { s3Key: 'sealed/a.pdf', sha256: 'aaa', byteSize: 10 };
+
+        expect((await repo.finaliseArtifact(envelopeId, 'sealed', bytes)).finalised).toBe(true);
+        // The same bytes again is a retry, not a second seal.
+        expect((await repo.finaliseArtifact(envelopeId, 'sealed', bytes)).finalised).toBe(true);
+        // Different bytes are a different document, and the chain attests to the first.
+        expect((await repo.finaliseArtifact(envelopeId, 'sealed', { s3Key: 'sealed/b.pdf', sha256: 'bbb', byteSize: 20 })).finalised).toBe(false);
+        expect((await repo.getArtifact(envelopeId, 'sealed')).s3Key).toBe('sealed/a.pdf');
+
+        await expect(repo.finaliseArtifact(envelopeId, 'sealed', { s3Key: 'sealed/c.pdf', sha256: 'ccc', byteSize: 0 }))
+            .rejects.toThrow(/no bytes/);
+    });
+
+    it('lets a seal that never produced any bytes be tried again', async () => {
+        // A throw between claiming the slot and uploading used to block every
+        // retry for ever: the slot was taken, so the document could never be
+        // sealed at all.
+        const { envelopeId } = await makeEnvelope();
+        const claim = { artifactId: id('art'), envelopeId, kind: 'sealed' as const, s3Key: 'pending', sha256: 'pending', byteSize: 0 };
+        expect(await repo.sealOnce(claim)).toEqual({ sealed: true });
+
+        const retry = await repo.sealOnce({ ...claim, artifactId: id('art') });
+        expect(retry).toEqual({ sealed: true, resumed: true });
+
+        await repo.finaliseArtifact(envelopeId, 'sealed', { s3Key: 'sealed/done.pdf', sha256: 'done', byteSize: 99 });
+
+        // Once there are bytes behind it, the slot is closed again.
+        const after = await repo.sealOnce({ ...claim, artifactId: id('art') });
+        expect(after.sealed).toBe(false);
+        expect(after.existingS3Key).toBe('sealed/done.pdf');
     });
 });
