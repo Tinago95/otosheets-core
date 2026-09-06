@@ -844,6 +844,20 @@ export class EnvelopePgRepo {
         return (r[0] as any) ?? null;
     }
 
+    /**
+     * Save edited wording or naming. Only these three fields: `kind` is fixed at
+     * creation because the tier follows from it, and letting it change after
+     * fields are placed would silently re-tier a prepared template.
+     */
+    async updateTemplate(templateId: string, patch: { name?: string; bodyMarkdown?: string; description?: string }): Promise<void> {
+        const set: Record<string, unknown> = { updatedAt: new Date().toISOString() };
+        if (patch.name !== undefined) set.name = patch.name;
+        if (patch.bodyMarkdown !== undefined) set.bodyMarkdown = patch.bodyMarkdown;
+        if (patch.description !== undefined) set.description = patch.description;
+        await (this.db as any).update(envelopeTemplates).set(set)
+            .where(eq(envelopeTemplates.templateId, templateId));
+    }
+
     /** Archived rather than deleted: a document already sent from it still names it. */
     async archiveTemplate(templateId: string): Promise<void> {
         await (this.db as any).update(envelopeTemplates)
