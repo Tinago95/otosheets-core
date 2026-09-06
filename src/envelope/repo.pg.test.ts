@@ -475,6 +475,128 @@ describe('reusable documents', () => {
     });
 });
 
+describe('roles, and sending a prepared template again', () => {
+    async function prepared() {
+        const templateId = id('tpl');
+        await repo.createTemplate({
+            templateId, orgId: 'org_1', createdBy: 'user_1', name: 'Subcontractor agreement',
+            kind: 'subcontractor_agreement', bodyMarkdown: '## Agreement for {{counterparty.name}}',
+        });
+        await repo.addTemplateRole({ templateRoleId: id('rol'), templateId, roleKey: 'counterparty', label: 'Counterparty', signingRole: 'signer', orderNo: 0 });
+        await repo.addTemplateRole({ templateRoleId: id('rol'), templateId, roleKey: 'us', label: 'Us', signingRole: 'signer', orderNo: 1 });
+        await repo.addTemplateRole({ templateRoleId: id('rol'), templateId, roleKey: 'lawyer', label: 'Our lawyer', signingRole: 'reviewer', required: false });
+        await repo.addTemplateField({ templateFieldId: id('tf'), templateId, roleKey: 'counterparty', type: 'signature', page: 1, x: 8, y: 70, w: 34, h: 8 });
+        await repo.addTemplateField({ templateFieldId: id('tf'), templateId, roleKey: 'counterparty', type: 'date', page: 1, x: 46, y: 70, w: 20, h: 8 });
+        await repo.addTemplateField({ templateFieldId: id('tf'), templateId, roleKey: 'us', type: 'signature', page: 1, x: 8, y: 84, w: 34, h: 8 });
+        return templateId;
+    }
+
+    it('places template fields against roles, never people', async () => {
+        const templateId = await prepared();
+        const fields = await repo.listTemplateFields(templateId);
+        expect(fields).toHaveLength(3);
+        expect(new Set(fields.map((f: any) => f.roleKey))).toEqual(new Set(['counterparty', 'us']));
+        expect(fields.every((f: any) => !('recipientId' in f))).toBe(true);
+    });
+
+    it('refuses a field on a role that cannot hold one', async () => {
+        const templateId = await prepared();
+        await expect(repo.addTemplateField({
+            templateFieldId: id('tf'), templateId, roleKey: 'lawyer', type: 'signature', page: 1, x: 1, y: 1, w: 5, h: 5,
+        })).rejects.toThrow(/cannot be assigned a field/);
+    });
+
+    it('refuses a field for a role nobody defined', async () => {
+        const templateId = await prepared();
+        await expect(repo.addTemplateField({
+            templateFieldId: id('tf'), templateId, roleKey: 'ghost', type: 'date', page: 1, x: 1, y: 1, w: 5, h: 5,
+        })).rejects.toThrow(/no role called/);
+    });
+
+    it('fills the roles with people and re-points the fields at them', async () => {
+        const templateId = await prepared();
+        const dave = id('rcp'); const owner = id('rcp');
+        const made = await repo.createFromTemplate({
+            envelopeId: id('env'), versionId: id('ver'), templateId, orgId: 'org_1', createdBy: 'user_1',
+            title: 'Agreement with Ellis',
+            roleAssignments: [
+                { roleKey: 'counterparty', recipientId: dave, email: 'dave@ellis.com', name: 'Dave Ellis' },
+                { roleKey: 'us', recipientId: owner, email: 'leon@halvorsen.com', name: 'Leon' },
+            ],
+        });
+
+        const recipients = await repo.listRecipients(made.envelopeId);
+        expect(recipients).toHaveLength(2);
+        expect((recipients as any[]).find((r) => r.recipientId === dave).roleKey).toBe('counterparty');
+
+        const versions = await repo.listVersions(made.envelopeId);
+        const fields = await repo.listFields((versions[0] as any).versionId) as any[];
+        expect(fields).toHaveLength(3);
+        expect(fields.filter((f) => f.recipientId === dave)).toHaveLength(2);
+        expect(fields.filter((f) => f.recipientId === owner)).toHaveLength(1);
+    });
+
+    it('sends the same prepared template again to somebody else', async () => {
+        const templateId = await prepared();
+        const first = id('rcp'); const second = id('rcp'); const ownerA = id('rcp'); const ownerB = id('rcp');
+
+        const a = await repo.createFromTemplate({
+            envelopeId: id('env'), versionId: id('ver'), templateId, orgId: 'org_1', createdBy: 'u',
+            roleAssignments: [
+                { roleKey: 'counterparty', recipientId: first, email: 'one@x.com' },
+                { roleKey: 'us', recipientId: ownerA, email: 'leon@x.com' },
+            ],
+        });
+        const b = await repo.createFromTemplate({
+            envelopeId: id('env'), versionId: id('ver'), templateId, orgId: 'org_1', createdBy: 'u',
+            roleAssignments: [
+                { roleKey: 'counterparty', recipientId: second, email: 'two@x.com' },
+                { roleKey: 'us', recipientId: ownerB, email: 'leon@x.com' },
+            ],
+        });
+
+        // Two separate documents, each with its own people and its own fields,
+        // and nothing was re-placed by hand.
+        expect(a.envelopeId).not.toBe(b.envelopeId);
+        for (const [env, who] of [[a, first], [b, second]] as const) {
+            const v = await repo.listVersions(env.envelopeId);
+            const f = await repo.listFields((v[0] as any).versionId) as any[];
+            expect(f.filter((x) => x.recipientId === who)).toHaveLength(2);
+        }
+        expect((await repo.getTemplate(templateId)).timesUsed).toBe(2);
+    });
+
+    it('will not send with a required role left empty', async () => {
+        const templateId = await prepared();
+        await expect(repo.createFromTemplate({
+            envelopeId: id('env'), versionId: id('ver'), templateId, orgId: 'org_1', createdBy: 'u',
+            roleAssignments: [{ roleKey: 'counterparty', recipientId: id('rcp'), email: 'one@x.com' }],
+        })).rejects.toThrow(/Nobody was given these roles: Us/);
+    });
+
+    it('refuses a role the template does not have', async () => {
+        const templateId = await prepared();
+        await expect(repo.createFromTemplate({
+            envelopeId: id('env'), versionId: id('ver'), templateId, orgId: 'org_1', createdBy: 'u',
+            roleAssignments: [{ roleKey: 'landlord', recipientId: id('rcp'), email: 'x@x.com' }],
+        })).rejects.toThrow(/no role called "landlord"/);
+    });
+
+    it('leaves an optional role unfilled without leaving a field orphaned', async () => {
+        const templateId = await prepared();
+        const c = id('rcp');
+        const made = await repo.createFromTemplate({
+            envelopeId: id('env'), versionId: id('ver'), templateId, orgId: 'org_1', createdBy: 'u',
+            roleAssignments: [
+                { roleKey: 'counterparty', recipientId: c, email: 'one@x.com' },
+                { roleKey: 'us', recipientId: id('rcp'), email: 'leon@x.com' },
+            ],
+        });
+        // The lawyer role is optional and was not filled; no recipient, no field.
+        expect(await repo.listRecipients(made.envelopeId)).toHaveLength(2);
+    });
+});
+
 describe('the vault', () => {
     it('pages with a cursor rather than returning everything', async () => {
         const org = 'org_vault';

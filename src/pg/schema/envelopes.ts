@@ -142,6 +142,12 @@ export const envelopeRecipients = pgTable('envelope_recipients', {
     bounceReason: text('bounce_reason'),
 
     // Reviewer only.
+    /**
+     * Which template role this person is filling, when the envelope came from a
+     * template. Null on an ad hoc document, where the person IS the slot.
+     */
+    roleKey: text('role_key'),
+
     verdict: text('verdict'),                         // approved | changes_proposed | rejected
     verdictAt: text('verdict_at'),
     verdictNote: text('verdict_note'),
@@ -312,4 +318,53 @@ export const envelopeTemplates = pgTable('envelope_templates', {
     updatedAt: text('updated_at').notNull(),
 }, (t) => [
     index('envelope_templates_org_idx').on(t.orgId, t.createdAt),
+]);
+
+/**
+ * A role on a template: a named slot such as counterparty, us, guarantor.
+ *
+ * This is the indirection the whole reuse story rests on. A field placed for
+ * Dave Ellis is meaningless for the next counterparty; a field placed for THE
+ * COUNTERPARTY works forever. Roles are what a template's fields point at, and
+ * filling them with people is what turns a template into an envelope.
+ *
+ * `role_key` is stable within a template and is what fields reference, so
+ * renaming the label a person sees does not orphan every field.
+ */
+export const envelopeTemplateRoles = pgTable('envelope_template_roles', {
+    templateRoleId: text('template_role_id').primaryKey(),
+    templateId: text('template_id').notNull().references(() => envelopeTemplates.templateId, { onDelete: 'cascade' }),
+    roleKey: text('role_key').notNull(),
+    label: text('label').notNull(),
+    // What kind of recipient this role becomes: signer, reviewer or viewer.
+    signingRole: text('signing_role').notNull(),
+    orderNo: integer('order_no').notNull().default(0),
+    required: boolean('required').notNull().default(true),
+    createdAt: text('created_at').notNull(),
+}, (t) => [
+    uniqueIndex('envelope_template_roles_key_uq').on(t.templateId, t.roleKey),
+]);
+
+/**
+ * A field on a template, bound to a role rather than a person.
+ *
+ * Copied onto the envelope at creation and re-pointed at whoever was given that
+ * role. Copied rather than referenced, for the same reason the wording is:
+ * editing the template later must not change a document already signed.
+ */
+export const envelopeTemplateFields = pgTable('envelope_template_fields', {
+    templateFieldId: text('template_field_id').primaryKey(),
+    templateId: text('template_id').notNull().references(() => envelopeTemplates.templateId, { onDelete: 'cascade' }),
+    roleKey: text('role_key').notNull(),
+    type: text('type').notNull(),
+    label: text('label'),
+    required: boolean('required').notNull().default(true),
+    page: integer('page').notNull(),
+    x: text('x').notNull(),
+    y: text('y').notNull(),
+    w: text('w').notNull(),
+    h: text('h').notNull(),
+    createdAt: text('created_at').notNull(),
+}, (t) => [
+    index('envelope_template_fields_template_idx').on(t.templateId),
 ]);

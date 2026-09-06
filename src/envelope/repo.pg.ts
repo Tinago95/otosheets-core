@@ -3,7 +3,7 @@ import { getPg, getPgTx, type PgDb } from '../pg/client';
 import {
     envelopes, envelopeVersions, envelopeRecipients, envelopeFields,
     envelopeSignatures, envelopeEvents, envelopeArtifacts, envelopeComments,
-    envelopeTemplates,
+    envelopeTemplates, envelopeTemplateRoles, envelopeTemplateFields,
 } from '../pg/schema/envelopes';
 import { hashChainEntry, verifyChain, type ChainEntryInput, type ChainVerdict, type ChainValue } from './chain';
 import {
@@ -46,6 +46,8 @@ export interface AddRecipientInput {
     email: string;
     name?: string | null;
     orderNo?: number;
+    /** Which template role this person fills. Null on an ad hoc document. */
+    roleKey?: string | null;
 }
 
 export interface DispatchInput {
@@ -109,6 +111,38 @@ export interface CreateTemplateInput {
     s3Key?: string | null;
 }
 
+export interface TemplateRoleInput {
+    templateRoleId: string;
+    templateId: string;
+    roleKey: string;
+    label: string;
+    signingRole: RecipientRole;
+    orderNo?: number;
+    required?: boolean;
+}
+
+export interface TemplateFieldInput {
+    templateFieldId: string;
+    templateId: string;
+    roleKey: string;
+    type: FieldType;
+    label?: string | null;
+    required?: boolean;
+    page: number;
+    x: number | string;
+    y: number | string;
+    w: number | string;
+    h: number | string;
+}
+
+/** One person, and which slot on the template they are filling. */
+export interface RoleAssignment {
+    roleKey: string;
+    recipientId: string;
+    email: string;
+    name?: string | null;
+}
+
 export interface CreateFromTemplateInput {
     envelopeId: string;
     versionId: string;
@@ -118,6 +152,11 @@ export interface CreateFromTemplateInput {
     createdByLabel?: string | null;
     /** Overrides the template name for this one document. */
     title?: string;
+    /**
+     * Who fills each role. Every required role must be given somebody, because
+     * a field with nobody to fill it is a document that can never complete.
+     */
+    roleAssignments?: RoleAssignment[];
 }
 
 export interface EnvelopeCursor { createdAt: string; envelopeId: string }
@@ -451,6 +490,7 @@ export class EnvelopePgRepo {
             orderNo: input.orderNo ?? 0,
             name: input.name ?? null,
             email: input.email,
+            roleKey: input.roleKey ?? null,
             status: 'pending',
             createdAt: now,
             updatedAt: now,
@@ -728,6 +768,68 @@ export class EnvelopePgRepo {
         return { templateId: input.templateId, created: inserted.length > 0 };
     }
 
+    async addTemplateRole(input: TemplateRoleInput): Promise<{ templateRoleId: string; created: boolean }> {
+        const inserted = await (this.db as any).insert(envelopeTemplateRoles).values({
+            templateRoleId: input.templateRoleId,
+            templateId: input.templateId,
+            roleKey: input.roleKey,
+            label: input.label,
+            signingRole: input.signingRole,
+            orderNo: input.orderNo ?? 0,
+            required: input.required ?? true,
+            createdAt: new Date().toISOString(),
+        }).onConflictDoNothing({ target: [envelopeTemplateRoles.templateId, envelopeTemplateRoles.roleKey] })
+            .returning({ id: envelopeTemplateRoles.templateRoleId });
+        return { templateRoleId: input.templateRoleId, created: inserted.length > 0 };
+    }
+
+    async listTemplateRoles(templateId: string) {
+        return this.db.select().from(envelopeTemplateRoles)
+            .where(eq(envelopeTemplateRoles.templateId, templateId))
+            .orderBy(asc(envelopeTemplateRoles.orderNo));
+    }
+
+    /**
+     * Place a field on a template, against a role.
+     *
+     * The role must already exist: a field pointing at a role nobody defined
+     * would silently never be filled, and the document would sit at "waiting on
+     * someone" for ever with no one to wait for.
+     */
+    async addTemplateField(input: TemplateFieldInput): Promise<{ templateFieldId: string; created: boolean }> {
+        const roles = await this.listTemplateRoles(input.templateId);
+        const role = (roles as any[]).find((r) => r.roleKey === input.roleKey);
+        if (!role) throw new Error(`This template has no role called "${input.roleKey}"`);
+        if (!canHoldFields(role.signingRole as RecipientRole)) {
+            throw new Error(`The ${role.label} role cannot be assigned a field`);
+        }
+
+        const inserted = await (this.db as any).insert(envelopeTemplateFields).values({
+            templateFieldId: input.templateFieldId,
+            templateId: input.templateId,
+            roleKey: input.roleKey,
+            type: input.type,
+            label: input.label ?? null,
+            required: input.required ?? true,
+            page: input.page,
+            x: String(input.x), y: String(input.y), w: String(input.w), h: String(input.h),
+            createdAt: new Date().toISOString(),
+        }).onConflictDoNothing({ target: envelopeTemplateFields.templateFieldId })
+            .returning({ id: envelopeTemplateFields.templateFieldId });
+        return { templateFieldId: input.templateFieldId, created: inserted.length > 0 };
+    }
+
+    async listTemplateFields(templateId: string) {
+        return this.db.select().from(envelopeTemplateFields)
+            .where(eq(envelopeTemplateFields.templateId, templateId))
+            .orderBy(asc(envelopeTemplateFields.page));
+    }
+
+    async removeTemplateField(templateFieldId: string): Promise<void> {
+        await (this.db as any).delete(envelopeTemplateFields)
+            .where(eq(envelopeTemplateFields.templateFieldId, templateFieldId));
+    }
+
     async listTemplates(orgId: string, includeArchived = false) {
         const clauses = [eq(envelopeTemplates.orgId, orgId)];
         if (!includeArchived) clauses.push(sql`${envelopeTemplates.archivedAt} IS NULL`);
@@ -761,6 +863,27 @@ export class EnvelopePgRepo {
         const template = await this.getTemplate(input.templateId);
         if (!template || template.orgId !== input.orgId) throw new Error('No such template');
 
+        const roles = (await this.listTemplateRoles(input.templateId)) as any[];
+        const assignments = input.roleAssignments ?? [];
+
+        // A name that is not a role at all comes first, because it explains the
+        // actual mistake. Reporting the roles left empty when the caller has
+        // misspelled one sends them looking for the wrong problem.
+        const unknown = assignments.filter((a) => !roles.some((r) => r.roleKey === a.roleKey));
+        if (unknown.length > 0) {
+            throw new Error(`This template has no role called "${unknown[0].roleKey}"`);
+        }
+
+        // Every required role needs somebody. A field with nobody to fill it is
+        // a document that can never complete, and it would sit at "waiting on
+        // someone" with no one to wait for.
+        const missing = roles
+            .filter((r) => r.required && !assignments.some((a) => a.roleKey === r.roleKey))
+            .map((r) => r.label);
+        if (missing.length > 0) {
+            throw new Error(`Nobody was given these roles: ${missing.join(', ')}`);
+        }
+
         const envelope = await this.create({
             envelopeId: input.envelopeId,
             orgId: input.orgId,
@@ -773,6 +896,41 @@ export class EnvelopePgRepo {
             bodyMarkdown: template.bodyMarkdown ?? null,
             s3Key: template.s3Key ?? null,
         });
+
+        // Fill the roles with people, then re-point the template's fields at
+        // whoever got each role. Copied rather than referenced, for the same
+        // reason the wording is: editing the template later must not change a
+        // document that has already gone out.
+        const byRole = new Map<string, string>();
+        for (const a of assignments) {
+            const role = roles.find((r) => r.roleKey === a.roleKey);
+            await this.addRecipient({
+                recipientId: a.recipientId,
+                envelopeId: input.envelopeId,
+                role: role.signingRole as RecipientRole,
+                email: a.email,
+                name: a.name ?? null,
+                orderNo: role.orderNo ?? 0,
+                roleKey: a.roleKey,
+            });
+            byRole.set(a.roleKey, a.recipientId);
+        }
+
+        const templateFields = (await this.listTemplateFields(input.templateId)) as any[];
+        for (const f of templateFields) {
+            const recipientId = byRole.get(f.roleKey);
+            if (!recipientId) continue; // an optional role nobody filled
+            await this.addField({
+                fieldId: `${input.envelopeId}:${f.templateFieldId}`,
+                versionId: input.versionId,
+                recipientId,
+                type: f.type,
+                label: f.label,
+                required: f.required,
+                page: f.page,
+                x: f.x, y: f.y, w: f.w, h: f.h,
+            });
+        }
 
         // Atomic increment, never read-modify-write: two people using the same
         // template at once should count as two.
