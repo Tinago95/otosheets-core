@@ -58,6 +58,15 @@ export const envelopes = pgTable('envelopes', {
     // verdict releases them. One Send, staged by role.
     holdSignersForReview: boolean('hold_signers_for_review').notNull().default(true),
 
+    // What the document was drafted FROM, kept on the envelope rather than the
+    // version. Without it a regenerate cannot prefill and has to ask for every
+    // answer again, and there is no record anywhere of which jurisdiction's law
+    // a signed contract was drafted under, which is the one thing a dispute
+    // opens with. Nullable: an uploaded PDF was never drafted from anything.
+    answers: jsonb('answers'),
+    jurisdiction: text('jurisdiction'),               // NSW | VIC | QLD | WA | SA | TAS | ACT | NT
+    effectiveDate: text('effective_date'),            // YYYY-MM-DD, not the created or signed date
+
     completedAt: text('completed_at'),
     voidedAt: text('voided_at'),
     voidedReason: text('voided_reason'),

@@ -140,6 +140,25 @@ describe('the chain', () => {
         expect(await repo.verifyChainFor(envelopeId)).toEqual({ ok: true, length: 9 });
     });
 
+    it('keeps the answers, the jurisdiction and the effective date it was drafted from', async () => {
+        // Without these the answers exist only as a request body thrown away
+        // after one model call, so a regenerate cannot prefill and the chain
+        // has no record of which jurisdiction the contract was drafted under.
+        const envelopeId = `env_${Math.random().toString(36).slice(2, 10)}`;
+        await repo.create({
+            envelopeId, orgId: 'org_1', createdBy: 'u1', title: 'Scope', kind: 'scope_of_works',
+            versionId: `ver_${Math.random().toString(36).slice(2, 10)}`, bodyMarkdown: '## x',
+            answers: { deposit_percent: '10', gst: 'ex_gst' },
+            jurisdiction: 'NSW',
+            effectiveDate: '2026-09-07',
+        } as any);
+
+        const got = await repo.get(envelopeId) as any;
+        expect(got.answers).toEqual({ deposit_percent: '10', gst: 'ex_gst' });
+        expect(got.jurisdiction).toBe('NSW');
+        expect(got.effectiveDate).toBe('2026-09-07');
+    });
+
     it('bounds the chain read, and walks the rest by seq', async () => {
         // A chain grows for as long as anyone touches a document, and every
         // refused access attempt is an entry, so reading all of it unbounded is

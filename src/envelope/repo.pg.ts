@@ -37,6 +37,16 @@ export interface CreateEnvelopeInput {
     s3Key?: string | null;
     sha256?: string | null;
     holdSignersForReview?: boolean;
+    /**
+     * What the questionnaire was answered with, and the two facts that shape
+     * the wording rather than describe it. Kept on the envelope so a regenerate
+     * can prefill, and so the chain can say which jurisdiction a contract was
+     * drafted under: without them the answers exist only as a request body that
+     * is thrown away after one model call.
+     */
+    answers?: Record<string, unknown> | null;
+    jurisdiction?: string | null;
+    effectiveDate?: string | null;
 }
 
 export interface AddRecipientInput {
@@ -417,6 +427,9 @@ export class EnvelopePgRepo {
                 status: 'draft',
                 currentVersionNo: 1,
                 holdSignersForReview: input.holdSignersForReview ?? true,
+                answers: (input.answers ?? null) as any,
+                jurisdiction: input.jurisdiction ?? null,
+                effectiveDate: input.effectiveDate ?? null,
                 createdAt: now,
                 updatedAt: now,
             }).onConflictDoNothing({ target: envelopes.envelopeId });

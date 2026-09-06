@@ -1,50 +1,20 @@
 /**
- * Documents (envelopes): types, and the tier rules.
+ * Documents (envelopes): the tier rules, and the recipient role rules.
  *
  * The tier engine lives here rather than in a handler on purpose. Drafting and
  * uploading are two different entry points, and a refusal list inside either one
  * is the tier engine built twice and badly. `kind` is a required enumerated
  * choice; `tier` is a pure lookup from it and is never accepted from a caller.
+ *
+ * The per-kind data itself moved to `registry.ts`, and these functions now read
+ * it. There is deliberately no second tier table here: two copies is how a
+ * tier 2 kind eventually ships as tier 0.
  */
 
-export const ENVELOPE_KINDS = [
-    // Tier 0, sales. Freely drafted.
-    'proposal',
-    'quote_cover',
-    'scope_of_works',
-    'capability_statement',
-    // Tier 1, standard. Review offered, drafting held back pending policy.
-    'subcontractor_agreement',
-    'service_agreement',
-    'nda',
-    'deposit_terms',
-    'variation_terms',
-    // Tier 2, regulated. Refused outright: these are the Australian cases where
-    // a contract is voidable without independent advice.
-    'employment',
-    'guarantor',
-    'prenuptial',
-    'small_business_loan',
-] as const;
-export type EnvelopeKind = typeof ENVELOPE_KINDS[number];
-
-export type EnvelopeTier = 0 | 1 | 2;
-
-const KIND_TIER: Record<EnvelopeKind, EnvelopeTier> = {
-    proposal: 0,
-    quote_cover: 0,
-    scope_of_works: 0,
-    capability_statement: 0,
-    subcontractor_agreement: 1,
-    service_agreement: 1,
-    nda: 1,
-    deposit_terms: 1,
-    variation_terms: 1,
-    employment: 2,
-    guarantor: 2,
-    prenuptial: 2,
-    small_business_loan: 2,
-};
+import {
+    CONTRACT_TYPES, ENVELOPE_KINDS, tryContractType,
+    type DraftMode, type EnvelopeAnswers, type EnvelopeKind, type EnvelopeTier,
+} from './registry';
 
 export function isEnvelopeKind(v: unknown): v is EnvelopeKind {
     return typeof v === 'string' && (ENVELOPE_KINDS as readonly string[]).includes(v);
@@ -53,7 +23,7 @@ export function isEnvelopeKind(v: unknown): v is EnvelopeKind {
 /** The only way a tier is ever set. Throws rather than defaulting, so an unknown kind cannot land as tier 0. */
 export function tierForKind(kind: string): EnvelopeTier {
     if (!isEnvelopeKind(kind)) throw new Error(`Unknown document kind: ${kind}`);
-    return KIND_TIER[kind];
+    return CONTRACT_TYPES[kind].tier;
 }
 
 /** Tier 2 is refused at both entry points. Fails closed on an unknown kind. */
@@ -65,13 +35,26 @@ export function isRefusedKind(kind: string): boolean {
     }
 }
 
-/** Drafting is tier 0 only for now: tier 1 is where review is offered, which is an unanswered policy question. */
+/** How this kind may be drafted, if at all. Empty for an unknown kind and for tier 2. */
+export function draftModesForKind(kind: string): readonly DraftMode[] {
+    return tryContractType(kind)?.draftModes ?? [];
+}
+
+/**
+ * Free-text drafting: "describe the job and we write it". Tier 0 only.
+ *
+ * Kept as the narrow gate it has always been. Tier 1 became draftable through
+ * the questionnaire, not through a brief, so widening this function would open
+ * the wrong door: callers that ask it are asking whether a paragraph of prose
+ * may become a document.
+ */
 export function canDraftKind(kind: string): boolean {
-    try {
-        return tierForKind(kind) === 0;
-    } catch {
-        return false;
-    }
+    return draftModesForKind(kind).includes('free_text');
+}
+
+/** Structured drafting: fixed clauses, and the answers are the only variables. Tier 0 and tier 1. */
+export function canDraftFromQuestionnaire(kind: string): boolean {
+    return draftModesForKind(kind).includes('questionnaire');
 }
 
 export type EnvelopeStatus =
@@ -117,6 +100,16 @@ export interface EnvelopeDTO {
     status: EnvelopeStatus;
     currentVersionNo: number;
     holdSignersForReview: boolean;
+
+    // What the document was drafted FROM. Persisted so a regenerate can prefill
+    // rather than asking everything again, and so the chain has a record of the
+    // jurisdiction a contract was actually drafted under. Null on an upload.
+    answers?: EnvelopeAnswers | null;
+    /** An AU state or territory code. Validate with isAustralianJurisdiction from the registry. */
+    jurisdiction?: string | null;
+    /** YYYY-MM-DD. When the document takes effect, which is neither when it was created nor when it was signed. */
+    effectiveDate?: string | null;
+
     completedAt?: string | null;
     voidedAt?: string | null;
     voidedReason?: string | null;
