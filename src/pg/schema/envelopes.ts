@@ -276,3 +276,40 @@ export const envelopeComments = pgTable('envelope_comments', {
     index('envelope_comments_version_idx').on(t.versionId),
     index('envelope_comments_env_created_idx').on(t.envelopeId, t.createdAt),
 ]);
+
+/**
+ * A reusable document. The same wording sent to many counterparties.
+ *
+ * Separate from `envelopes` rather than an `isTemplate` flag on one, because a
+ * template has no recipients, no status machine, no chain and no signatures: it
+ * is the thing an envelope is made FROM. Folding the two together would mean
+ * every query over real documents had to remember to exclude templates, which
+ * is the kind of filter someone eventually forgets.
+ *
+ * `body_markdown` carries anchor tokens ({{sig:counterparty}}, {{date:owner}})
+ * that become fields when a document is generated from it, which is what lets
+ * one template serve every counterparty. `s3_key` is the other shape: a file
+ * uploaded once and sent repeatedly.
+ */
+export const envelopeTemplates = pgTable('envelope_templates', {
+    templateId: text('template_id').primaryKey(),
+    orgId: text('org_id').notNull().references(() => orgs.orgId, { onDelete: 'cascade' }),
+    businessProfileId: text('business_profile_id'),
+    createdBy: text('created_by').notNull(),
+
+    name: text('name').notNull(),
+    description: text('description'),
+    // Fixed at the template, not chosen per send: the whole point is that the
+    // same kind of document goes out the same way every time.
+    kind: text('kind').notNull(),
+
+    bodyMarkdown: text('body_markdown'),
+    s3Key: text('s3_key'),
+
+    timesUsed: integer('times_used').notNull().default(0),
+    archivedAt: text('archived_at'),
+    createdAt: text('created_at').notNull(),
+    updatedAt: text('updated_at').notNull(),
+}, (t) => [
+    index('envelope_templates_org_idx').on(t.orgId, t.createdAt),
+]);
