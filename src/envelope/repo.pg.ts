@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, sql } from 'drizzle-orm';
+import { and, asc, desc, eq, gte, sql } from 'drizzle-orm';
 import { getPg, getPgTx, type PgDb } from '../pg/client';
 import {
     envelopes, envelopeVersions, envelopeRecipients, envelopeFields,
@@ -323,10 +323,72 @@ export class EnvelopePgRepo {
         return verifyChain(rows as any);
     }
 
-    async listEvents(envelopeId: string) {
-        return this.db.select().from(envelopeEvents)
-            .where(eq(envelopeEvents.envelopeId, envelopeId))
-            .orderBy(asc(envelopeEvents.seq));
+    /**
+     * The chain, oldest first, bounded.
+     *
+     * A document's chain grows for as long as anyone touches it, and every
+     * refused access attempt is an entry, so an unbounded read here is a
+     * payload that gets slower for exactly the documents that saw the most
+     * activity. The default is generous because a chain is usually short and
+     * the owner wants all of it; `fromSeq` walks the rest.
+     */
+    async listEvents(
+        envelopeId: string,
+        opts: { limit?: number; fromSeq?: number } = {},
+    ): Promise<{ items: any[]; nextSeq: number | null }> {
+        const limit = Math.min(Math.max(opts.limit ?? 200, 1), 500);
+        const rows = await this.db.select().from(envelopeEvents)
+            .where(and(
+                eq(envelopeEvents.envelopeId, envelopeId),
+                opts.fromSeq ? gte(envelopeEvents.seq, opts.fromSeq) : undefined,
+            ))
+            .orderBy(asc(envelopeEvents.seq))
+            .limit(limit + 1);
+
+        const items = rows.slice(0, limit);
+        const nextSeq = rows.length > limit ? Number((rows[limit] as any).seq) : null;
+        return { items, nextSeq };
+    }
+
+    /**
+     * Every signature on one version, voided ones included.
+     *
+     * A voided signature is kept and returned rather than hidden: the record
+     * still has to say consent was given, and when it stopped applying.
+     */
+    async listSignatures(versionId: string) {
+        return this.db.select().from(envelopeSignatures)
+            .where(eq(envelopeSignatures.versionId, versionId))
+            .orderBy(asc(envelopeSignatures.signedAt));
+    }
+
+    /**
+     * Attach a rendered PDF to a version that was authored as markdown.
+     *
+     * Separate from createVersion, which only ever inserts and supersedes, so
+     * rendering a draft cannot mint a version number and orphan the fields
+     * placed against the one before it.
+     *
+     * Scoped by envelope for the same reason revokeRecipient is: the caller has
+     * proved which document it owns, and a version id on its own is a string
+     * they sent us. Refuses to overwrite a version that already has bytes,
+     * because a rendered document that has been signed against must not change
+     * underneath the signature.
+     */
+    async attachRendered(
+        envelopeId: string,
+        versionId: string,
+        input: { s3Key: string; sha256: string },
+    ): Promise<{ attached: boolean }> {
+        const rows = await (this.db as any).update(envelopeVersions)
+            .set({ s3Key: input.s3Key, sha256: input.sha256 })
+            .where(and(
+                eq(envelopeVersions.versionId, versionId),
+                eq(envelopeVersions.envelopeId, envelopeId),
+                sql`${envelopeVersions.s3Key} IS NULL`,
+            ))
+            .returning({ id: envelopeVersions.versionId });
+        return { attached: rows.length > 0 };
     }
 
     // ── envelopes ────────────────────────────────────────────────────────

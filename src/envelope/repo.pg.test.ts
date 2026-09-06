@@ -93,7 +93,7 @@ describe('creating an envelope', () => {
         expect(env?.status).toBe('draft');
         expect(env?.currentVersionNo).toBe(1);
 
-        const events = await repo.listEvents(envelopeId);
+        const { items: events } = await repo.listEvents(envelopeId);
         expect(events).toHaveLength(1);
         expect((events[0] as any).seq).toBe(1);
         expect((events[0] as any).prevHash).toBeNull();
@@ -117,7 +117,7 @@ describe('the chain', () => {
         for (const type of ['sent', 'opened', 'signed']) {
             await repo.appendEvent(envelopeId, { type, actorType: 'system' }, (s) => `${envelopeId}:${s}`);
         }
-        const events = await repo.listEvents(envelopeId);
+        const { items: events } = await repo.listEvents(envelopeId);
         expect(events.map((e: any) => e.seq)).toEqual([1, 2, 3, 4]);
         for (let i = 1; i < events.length; i++) {
             expect((events[i] as any).prevHash).toBe((events[i - 1] as any).hash);
@@ -134,10 +134,63 @@ describe('the chain', () => {
             Array.from({ length: 8 }, (_, i) =>
                 repo.appendEvent(envelopeId, { type: `race_${i}`, actorType: 'system' }, (s) => `${envelopeId}:${s}`)),
         );
-        const events = await repo.listEvents(envelopeId);
+        const { items: events } = await repo.listEvents(envelopeId);
         expect(events).toHaveLength(9); // the root plus eight
         expect(events.map((e: any) => e.seq)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9]);
         expect(await repo.verifyChainFor(envelopeId)).toEqual({ ok: true, length: 9 });
+    });
+
+    it('bounds the chain read, and walks the rest by seq', async () => {
+        // A chain grows for as long as anyone touches a document, and every
+        // refused access attempt is an entry, so reading all of it unbounded is
+        // a payload that gets slower for exactly the documents that saw the most
+        // activity.
+        const { envelopeId } = await makeEnvelope();
+        for (let i = 0; i < 12; i++) {
+            await repo.appendEvent(envelopeId, { type: `e_${i}`, actorType: 'system' }, (s) => `${envelopeId}:${s}`);
+        }
+        const first = await repo.listEvents(envelopeId, { limit: 5 });
+        expect(first.items.map((e: any) => e.seq)).toEqual([1, 2, 3, 4, 5]);
+        expect(first.nextSeq).toBe(6);
+
+        const rest = await repo.listEvents(envelopeId, { limit: 100, fromSeq: first.nextSeq! });
+        expect(rest.items.map((e: any) => e.seq)).toEqual([6, 7, 8, 9, 10, 11, 12, 13]);
+        expect(rest.nextSeq).toBeNull();
+    });
+
+    it('attaches a rendered PDF once, and refuses to change one already rendered', async () => {
+        // A rendered document that has been signed against must not change
+        // underneath the signature, and attaching is deliberately not
+        // createVersion: minting a version number here would orphan every field
+        // placed against the one before it.
+        const { envelopeId } = await makeEnvelope();
+        const [version] = await repo.listVersions(envelopeId) as any[];
+
+        const first = await repo.attachRendered(envelopeId, version.versionId, {
+            s3Key: 'documents/org_1/rendered/a.pdf', sha256: 'a'.repeat(64),
+        });
+        expect(first.attached).toBe(true);
+
+        const again = await repo.attachRendered(envelopeId, version.versionId, {
+            s3Key: 'documents/org_1/rendered/b.pdf', sha256: 'b'.repeat(64),
+        });
+        expect(again.attached).toBe(false);
+
+        const [after] = await repo.listVersions(envelopeId) as any[];
+        expect(after.s3Key).toBe('documents/org_1/rendered/a.pdf');
+    });
+
+    it('will not attach a rendered PDF to another org\'s version', async () => {
+        const mine = await makeEnvelope();
+        const theirs = await makeEnvelope();
+        const [theirVersion] = await repo.listVersions(theirs.envelopeId) as any[];
+
+        // My envelope id, their version id. The version id alone is a string
+        // the caller sent us; the envelope is what they proved they own.
+        const out = await repo.attachRendered(mine.envelopeId, theirVersion.versionId, {
+            s3Key: 'documents/org_1/rendered/x.pdf', sha256: 'c'.repeat(64),
+        });
+        expect(out.attached).toBe(false);
     });
 
     it('notices when a stored entry is edited afterwards', async () => {
