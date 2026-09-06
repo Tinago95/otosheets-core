@@ -397,6 +397,84 @@ describe('authoring', () => {
     });
 });
 
+describe('reusable documents', () => {
+    it('creates a template and lists it, retry-safe on the id', async () => {
+        const templateId = id('tpl');
+        const args = {
+            templateId, orgId: 'org_1', createdBy: 'user_1', name: 'Standard roofing proposal',
+            kind: 'proposal', bodyMarkdown: '## Proposal\n\n{{sig:counterparty}} {{date:counterparty}}',
+        };
+        expect((await repo.createTemplate(args)).created).toBe(true);
+        expect((await repo.createTemplate(args)).created).toBe(false);
+
+        const list = await repo.listTemplates('org_1');
+        expect(list.map((t: any) => t.templateId)).toContain(templateId);
+        expect((await repo.getTemplate(templateId)).timesUsed).toBe(0);
+    });
+
+    it('refuses a template for a kind that is not handled here', async () => {
+        await expect(repo.createTemplate({
+            templateId: id('tpl'), orgId: 'org_1', createdBy: 'user_1',
+            name: 'Employment', kind: 'employment',
+        })).rejects.toThrow(/not handled here/);
+    });
+
+    it('makes a document from a template and counts the use', async () => {
+        const templateId = id('tpl');
+        await repo.createTemplate({
+            templateId, orgId: 'org_1', createdBy: 'user_1', name: 'NDA',
+            kind: 'nda', bodyMarkdown: '## NDA {{sig:counterparty}}',
+        });
+
+        const made = await repo.createFromTemplate({
+            envelopeId: id('env'), versionId: id('ver'), templateId,
+            orgId: 'org_1', createdBy: 'user_1', title: 'NDA for Ellis',
+        });
+
+        expect(made.title).toBe('NDA for Ellis');
+        expect(made.kind).toBe('nda');
+        expect(made.tier).toBe(1);
+        expect((await repo.getTemplate(templateId)).timesUsed).toBe(1);
+
+        const versions = await repo.listVersions(made.envelopeId);
+        expect((versions[0] as any).bodyMarkdown).toBe('## NDA {{sig:counterparty}}');
+    });
+
+    it('copies the wording rather than referencing it, so a later edit cannot change what was sent', async () => {
+        const templateId = id('tpl');
+        await repo.createTemplate({
+            templateId, orgId: 'org_1', createdBy: 'user_1', name: 'Terms',
+            kind: 'proposal', bodyMarkdown: 'original wording',
+        });
+        const made = await repo.createFromTemplate({
+            envelopeId: id('env'), versionId: id('ver'), templateId, orgId: 'org_1', createdBy: 'user_1',
+        });
+
+        await pglite.query("UPDATE envelope_templates SET body_markdown = 'edited later' WHERE template_id = $1", [templateId]);
+
+        const versions = await repo.listVersions(made.envelopeId);
+        expect((versions[0] as any).bodyMarkdown).toBe('original wording');
+    });
+
+    it('will not use another org template', async () => {
+        const templateId = id('tpl');
+        await repo.createTemplate({ templateId, orgId: 'org_1', createdBy: 'u', name: 'Mine', kind: 'proposal', bodyMarkdown: 'x' });
+        await expect(repo.createFromTemplate({
+            envelopeId: id('env'), versionId: id('ver'), templateId, orgId: 'org_OTHER', createdBy: 'u',
+        })).rejects.toThrow(/No such template/);
+    });
+
+    it('archives rather than deletes, so a sent document still names it', async () => {
+        const templateId = id('tpl');
+        await repo.createTemplate({ templateId, orgId: 'org_1', createdBy: 'u', name: 'Old', kind: 'proposal', bodyMarkdown: 'x' });
+        await repo.archiveTemplate(templateId);
+
+        expect((await repo.listTemplates('org_1')).map((t: any) => t.templateId)).not.toContain(templateId);
+        expect((await repo.listTemplates('org_1', true)).map((t: any) => t.templateId)).toContain(templateId);
+        expect(await repo.getTemplate(templateId)).toBeTruthy();
+    });
+});
+
 describe('the vault', () => {
     it('pages with a cursor rather than returning everything', async () => {
         const org = 'org_vault';

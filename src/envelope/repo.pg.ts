@@ -3,6 +3,7 @@ import { getPg, getPgTx, type PgDb } from '../pg/client';
 import {
     envelopes, envelopeVersions, envelopeRecipients, envelopeFields,
     envelopeSignatures, envelopeEvents, envelopeArtifacts, envelopeComments,
+    envelopeTemplates,
 } from '../pg/schema/envelopes';
 import { hashChainEntry, verifyChain, type ChainEntryInput, type ChainVerdict, type ChainValue } from './chain';
 import {
@@ -94,6 +95,29 @@ export interface AddCommentInput {
     anchorQuote?: string | null;
     body: string;
     proposedText?: string | null;
+}
+
+export interface CreateTemplateInput {
+    templateId: string;
+    orgId: string;
+    businessProfileId?: string | null;
+    createdBy: string;
+    name: string;
+    description?: string | null;
+    kind: string;
+    bodyMarkdown?: string | null;
+    s3Key?: string | null;
+}
+
+export interface CreateFromTemplateInput {
+    envelopeId: string;
+    versionId: string;
+    templateId: string;
+    orgId: string;
+    createdBy: string;
+    createdByLabel?: string | null;
+    /** Overrides the template name for this one document. */
+    title?: string;
 }
 
 export interface EnvelopeCursor { createdAt: string; envelopeId: string }
@@ -678,6 +702,85 @@ export class EnvelopePgRepo {
                 eq(envelopeComments.commentId, commentId),
                 sql`${envelopeComments.resolvedAt} IS NULL`,
             ));
+    }
+
+    // ── reusable documents ───────────────────────────────────────────────
+
+    async createTemplate(input: CreateTemplateInput): Promise<{ templateId: string; created: boolean }> {
+        if (isRefusedKind(input.kind)) {
+            throw new Error(`Documents of kind "${input.kind}" are not handled here`);
+        }
+        const now = new Date().toISOString();
+        const inserted = await (this.db as any).insert(envelopeTemplates).values({
+            templateId: input.templateId,
+            orgId: input.orgId,
+            businessProfileId: input.businessProfileId ?? null,
+            createdBy: input.createdBy,
+            name: input.name,
+            description: input.description ?? null,
+            kind: input.kind,
+            bodyMarkdown: input.bodyMarkdown ?? null,
+            s3Key: input.s3Key ?? null,
+            createdAt: now,
+            updatedAt: now,
+        }).onConflictDoNothing({ target: envelopeTemplates.templateId })
+            .returning({ id: envelopeTemplates.templateId });
+        return { templateId: input.templateId, created: inserted.length > 0 };
+    }
+
+    async listTemplates(orgId: string, includeArchived = false) {
+        const clauses = [eq(envelopeTemplates.orgId, orgId)];
+        if (!includeArchived) clauses.push(sql`${envelopeTemplates.archivedAt} IS NULL`);
+        return this.db.select().from(envelopeTemplates)
+            .where(and(...clauses))
+            .orderBy(desc(envelopeTemplates.createdAt));
+    }
+
+    async getTemplate(templateId: string) {
+        const r = await this.db.select().from(envelopeTemplates)
+            .where(eq(envelopeTemplates.templateId, templateId)).limit(1);
+        return (r[0] as any) ?? null;
+    }
+
+    /** Archived rather than deleted: a document already sent from it still names it. */
+    async archiveTemplate(templateId: string): Promise<void> {
+        await (this.db as any).update(envelopeTemplates)
+            .set({ archivedAt: new Date().toISOString(), updatedAt: new Date().toISOString() })
+            .where(eq(envelopeTemplates.templateId, templateId));
+    }
+
+    /**
+     * Make a document from a template.
+     *
+     * The template's wording and kind are copied onto the new envelope rather
+     * than referenced, so editing the template later cannot change a document
+     * that has already gone out. That is a deliberate frozen copy: what someone
+     * signed has to stay what it was.
+     */
+    async createFromTemplate(input: CreateFromTemplateInput): Promise<EnvelopeDTO> {
+        const template = await this.getTemplate(input.templateId);
+        if (!template || template.orgId !== input.orgId) throw new Error('No such template');
+
+        const envelope = await this.create({
+            envelopeId: input.envelopeId,
+            orgId: input.orgId,
+            businessProfileId: template.businessProfileId ?? null,
+            createdBy: input.createdBy,
+            createdByLabel: input.createdByLabel ?? null,
+            title: input.title || template.name,
+            kind: template.kind,
+            versionId: input.versionId,
+            bodyMarkdown: template.bodyMarkdown ?? null,
+            s3Key: template.s3Key ?? null,
+        });
+
+        // Atomic increment, never read-modify-write: two people using the same
+        // template at once should count as two.
+        await (this.db as any).update(envelopeTemplates)
+            .set({ timesUsed: sql`${envelopeTemplates.timesUsed} + 1`, updatedAt: new Date().toISOString() })
+            .where(eq(envelopeTemplates.templateId, input.templateId));
+
+        return envelope;
     }
 
     // ── the vault ────────────────────────────────────────────────────────
