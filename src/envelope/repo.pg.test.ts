@@ -159,6 +159,63 @@ describe('the chain', () => {
         expect(got.effectiveDate).toBe('2026-09-07');
     });
 
+    it('expires a document only when nobody can still sign it', async () => {
+        // One signer's dead link must not close a document another signer can
+        // still sign. That is the whole reason expireOnce is conditional on the
+        // recipients rather than just on the clock.
+        const past = new Date(Date.now() - 86_400_000).toISOString();
+        const future = new Date(Date.now() + 86_400_000).toISOString();
+        const now = new Date().toISOString();
+
+        const { envelopeId } = await makeEnvelope();
+        await repo.setEnvelopeStatus(envelopeId, 'out_for_signing');
+        const dead = await repo.addRecipient({
+            recipientId: `r_${Math.random().toString(36).slice(2, 8)}`,
+            envelopeId, email: 'a@x.com', role: 'signer',
+        } as any);
+        const live = await repo.addRecipient({
+            recipientId: `r_${Math.random().toString(36).slice(2, 8)}`,
+            envelopeId, email: 'b@x.com', role: 'signer',
+        } as any);
+        await repo.markDispatched({ recipientId: dead.recipientId, tokenHash: 'a'.repeat(64), expiresAt: past });
+        await repo.markDispatched({ recipientId: live.recipientId, tokenHash: 'b'.repeat(64), expiresAt: future });
+
+        expect((await repo.expireOnce(envelopeId, now)).expired).toBe(false);
+
+        // Once the live link lapses too, it expires, and only once.
+        await repo.markDispatched({ recipientId: live.recipientId, tokenHash: 'c'.repeat(64), expiresAt: past });
+        expect((await repo.expireOnce(envelopeId, now)).expired).toBe(true);
+        expect((await repo.expireOnce(envelopeId, now)).expired).toBe(false);
+        expect((await repo.get(envelopeId) as any).status).toBe('expired');
+    });
+
+    it('claims the one reminder, and the second caller loses', async () => {
+        const { envelopeId } = await makeEnvelope();
+        const r = await repo.addRecipient({
+            recipientId: `r_${Math.random().toString(36).slice(2, 8)}`,
+            envelopeId, email: 'a@x.com', role: 'signer',
+        } as any);
+        const at = new Date().toISOString();
+        expect((await repo.markRemindedOnce(r.recipientId, at)).claimed).toBe(true);
+        expect((await repo.markRemindedOnce(r.recipientId, at)).claimed).toBe(false);
+    });
+
+    it('records a decline once, so a double tap is one entry', async () => {
+        const { envelopeId } = await makeEnvelope();
+        const r = await repo.addRecipient({
+            recipientId: `r_${Math.random().toString(36).slice(2, 8)}`,
+            envelopeId, email: 'a@x.com', role: 'signer',
+        } as any);
+        const at = new Date().toISOString();
+        expect((await repo.declineOnce(r.recipientId, 'price changed', at)).declined).toBe(true);
+        expect((await repo.declineOnce(r.recipientId, 'price changed', at)).declined).toBe(false);
+
+        const [row] = (await repo.listRecipients(envelopeId) as any[])
+            .filter((x) => x.recipientId === r.recipientId);
+        expect(row.status).toBe('declined');
+        expect(row.declinedReason).toBe('price changed');
+    });
+
     it('bounds the chain read, and walks the rest by seq', async () => {
         // A chain grows for as long as anyone touches a document, and every
         // refused access attempt is an entry, so reading all of it unbounded is

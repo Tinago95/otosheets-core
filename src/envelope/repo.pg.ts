@@ -1,4 +1,5 @@
 import { and, asc, desc, eq, gte, sql } from 'drizzle-orm';
+import { makeSweepQueries } from './sweep.pg';
 import { getPg, getPgTx, type PgDb } from '../pg/client';
 import {
     envelopes, envelopeVersions, envelopeRecipients, envelopeFields,
@@ -1382,6 +1383,35 @@ export class EnvelopePgRepo {
             .where(and(...clauses))
             .orderBy(asc(envelopeArtifacts.createdAt));
     }
+    // ── The daily sweep's due-work queries ───────────────────────────────
+    //
+    // Delegated to sweep.pg.ts rather than written inline: these are the only
+    // queries in this repo written for a cron rather than a request, and what
+    // matters about them is different. A request reads the one document
+    // somebody is looking at; these read across every document on the platform,
+    // so each one has to be indexed, bounded and cursor-paged or it is a scan.
+
+    listRecipientsPastExpiry(now: string, limit: number, cursor: any) {
+        return makeSweepQueries(this.db).listRecipientsPastExpiry(now, limit, cursor);
+    }
+
+    expireOnce(envelopeId: string, now: string) {
+        return makeSweepQueries(this.db).expireOnce(envelopeId, now);
+    }
+
+    listRecipientsDueReminder(dispatchedBefore: string, now: string, limit: number, cursor: any) {
+        return makeSweepQueries(this.db)
+            .listRecipientsDueReminder(dispatchedBefore, now, limit, cursor);
+    }
+
+    markRemindedOnce(recipientId: string, at: string) {
+        return makeSweepQueries(this.db).markRemindedOnce(recipientId, at);
+    }
+
+    declineOnce(recipientId: string, reason: string, at: string) {
+        return makeSweepQueries(this.db).declineOnce(recipientId, reason, at);
+    }
+
 }
 
 /**

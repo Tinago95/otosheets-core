@@ -150,6 +150,18 @@ export const envelopeRecipients = pgTable('envelope_recipients', {
     bounceType: text('bounce_type'),
     bounceReason: text('bounce_reason'),
 
+    // The one reminder. A column rather than the chain, because appendEvent
+    // retries a duplicate id and then throws, so "already reminded" would be
+    // indistinguishable from a contended chain, and the guard on whether to
+    // send an email must never rest on parsing an error message.
+    remindedAt: text('reminded_at'),
+
+    // Somebody said no. The status column carries 'declined' too, but a
+    // timestamp is what makes the write conditional, and the reason is the
+    // whole point of asking.
+    declinedAt: text('declined_at'),
+    declinedReason: text('declined_reason'),
+
     // Reviewer only.
     /**
      * Which template role this person is filling, when the envelope came from a
